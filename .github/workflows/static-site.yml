@@ -1,0 +1,217 @@
+# Pipeline reutilizável dos sites estáticos (HTML/CSS/JS sem build).
+#
+# Cada site chama este arquivo com poucas linhas (ver exemplos/deploy.yml).
+# Etapas:
+#   1. Segredos   gitleaks no histórico inteiro                       push e PR
+#   2. Imagem     build, sobe o container read-only e testa as rotas  push e PR
+#                 publica no GHCR                                      só push na branch padrão
+#   3. Deploy     troca o newTag do overlay no ew-gitops (App)         só push na branch padrão
+#   4. Verificar  espera /version.txt mostrar a tag nova               só se verify-url for informado
+#
+# Mesmos princípios da pipeline da ew-api: permissões mínimas por etapa, só actions
+# oficiais do GitHub e da Docker, tag sha-<7 do commit>.
+
+name: static-site
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: "Nome do overlay no ew-gitops (ex.: pfo). Pasta <gitops-path>/<site>."
+        type: string
+        required: true
+      gitops-app-client-id:
+        description: "Client ID do GitHub App com escrita no ew-gitops (vars.GITOPS_APP_CLIENT_ID)."
+        type: string
+        required: true
+      gitops-owner:
+        type: string
+        default: EW-IT-SOLUTIONS
+      gitops-repo:
+        type: string
+        default: ew-gitops
+      gitops-path:
+        type: string
+        default: workloads/instituto-sites/overlays
+      ci-ref:
+        description: "Versão deste repositório usada no build (Dockerfile, nginx.conf, teste). Use a mesma do @ da chamada."
+        type: string
+        default: v1
+      verify-url:
+        description: "https://dominio do site. Vazio pula a verificação (use vazio até virar o DNS)."
+        type: string
+        default: ""
+      ignorar-links:
+        description: "Regex de links quebrados já conhecidos, que viram aviso em vez de erro."
+        type: string
+        default: ""
+    secrets:
+      gitops-app-private-key:
+        description: "Chave privada do GitHub App (secrets.GITOPS_APP_PRIVATE_KEY)."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  segredos:
+    name: 1. Segredos
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: gitleaks no histórico inteiro
+        run: |
+          V=8.30.1
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tgz gitleaks
+          ./gitleaks git --redact --verbose --exit-code 1 .
+
+  imagem:
+    name: 2. Imagem e rotas
+    needs: segredos
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Receita de build (static-site-ci)
+        uses: actions/checkout@v7
+        with:
+          repository: EW-IT-SOLUTIONS/static-site-ci
+          ref: ${{ inputs.ci-ref }}
+          path: _ci
+          persist-credentials: false
+
+      - name: Nome e tag da imagem
+        id: meta
+        run: |
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: _ci/docker/Dockerfile
+          build-contexts: ci=_ci/docker
+          build-args: APP_VERSION=${{ steps.meta.outputs.tag }}
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ github.repository }}
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}
+
+      - name: Testar rotas no container (read-only, como no cluster)
+        env:
+          IMG: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          IGNORAR: ${{ inputs.ignorar-links }}
+        run: |
+          docker run -d --name site -p 8080:8080 --read-only --tmpfs /tmp \
+            --user 101 --cap-drop ALL "$IMG"
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8080/healthz >/dev/null && break
+            sleep 1
+          done
+          python3 _ci/test/testar-rotas.py http://127.0.0.1:8080 . --versao "$TAG" --ignorar "$IGNORAR"
+
+      - name: Logs do container
+        if: failure()
+        run: docker logs site || true
+
+      - name: Login no GHCR
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar no GHCR
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        env:
+          IMG: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+        run: docker push "$IMG"
+
+  deploy:
+    name: 3. Deploy (ew-gitops)
+    needs: imagem
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Token de 1 h do App (escrita só no ew-gitops)
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.gitops-app-client-id }}
+          private-key: ${{ secrets.gitops-app-private-key }}
+          owner: ${{ inputs.gitops-owner }}
+          repositories: ${{ inputs.gitops-repo }}
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.gitops-owner }}/${{ inputs.gitops-repo }}
+          token: ${{ steps.app.outputs.token }}
+          path: gitops
+
+      - name: Trocar a tag no overlay
+        working-directory: gitops
+        env:
+          SITE: ${{ inputs.site }}
+          GITOPS_PATH: ${{ inputs.gitops-path }}
+          TAG: ${{ needs.imagem.outputs.tag }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          ARQ="${GITOPS_PATH}/${SITE}/kustomization.yaml"
+          test -f "$ARQ" || { echo "::error::$ARQ não existe no ew-gitops"; exit 1; }
+          grep -qE 'newTag: sha-[0-9a-f]+' "$ARQ" || { echo "::error::$ARQ sem linha newTag: sha-..."; exit 1; }
+          sed -i -E "s/(newTag: )sha-[0-9a-f]+/\1${TAG}/" "$ARQ"
+          if git diff --quiet; then echo "Overlay já estava em ${TAG}"; exit 0; fi
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${SLUG}[bot]@users.noreply.github.com"
+          git commit -am "instituto ${SITE}: ${TAG} (${GITHUB_REPOSITORY}@${GITHUB_SHA::7})"
+          for i in 1 2 3; do
+            git push && exit 0
+            echo "push recusado (tentativa $i), rebase e nova tentativa"
+            sleep $((i * 3))
+            git pull --rebase
+          done
+          exit 1
+
+  verificar:
+    name: 4. Verificar no ar
+    needs: [imagem, deploy]
+    if: inputs.verify-url != '' && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Esperar /version.txt com a tag nova (até 8 min)
+        env:
+          URL: ${{ inputs.verify-url }}
+          TAG: ${{ needs.imagem.outputs.tag }}
+        run: |
+          for i in $(seq 1 48); do
+            V=$(curl -fsS "${URL%/}/version.txt?t=$(date +%s)" 2>/dev/null | tr -d '[:space:]' || true)
+            echo "tentativa $i: no ar=${V:-?} esperado=${TAG}"
+            if [ "$V" = "$TAG" ]; then
+              curl -fsS -o /dev/null -w "home: %{http_code}\n" "${URL%/}/"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::${URL} não mostrou ${TAG} em 8 minutos"
+          exit 1

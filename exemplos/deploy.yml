@@ -1,0 +1,30 @@
+# Publica este site no servidor da EW (MicroK8s) a cada push na branch padrão.
+# A receita completa fica em EW-IT-SOLUTIONS/static-site-ci; aqui só os parâmetros.
+name: deploy
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  site:
+    uses: EW-IT-SOLUTIONS/static-site-ci/.github/workflows/static-site.yml@v1
+    with:
+      site: pfo
+      ci-ref: v1
+      gitops-app-client-id: ${{ vars.GITOPS_APP_CLIENT_ID }}
+      # Deixe vazio até o DNS apontar para o servidor; depois: https://pfo.institutodradeboracamilo.com.br
+      verify-url: ""
+
+    secrets:
+      gitops-app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}

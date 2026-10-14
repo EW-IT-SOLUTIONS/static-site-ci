@@ -1,0 +1,19 @@
+# O que NÃO vai para dentro da imagem (e portanto não fica público no site).
+
+# Git, CI e configs de hospedagem antiga
+.git
+.github
+.gitignore
+.gitleaksignore
+_ci
+vercel.json
+Dockerfile*
+
+# Lixo do macOS e duplicatas do Finder ("index 2.html")
+**/.DS_Store
+**/* 2.*
+
+# Documentos internos: copies, READMEs, rascunhos, backups e versões antigas
+**/*.md
+**/*backup*
+**/*antigo*
